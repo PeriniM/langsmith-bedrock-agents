@@ -10,7 +10,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-from observability import observe_response
+from observability import observe_response, active_spans
 from observability.attributes import SpanAttributes
 
 # Load environment variables from .env file if it exists
@@ -62,15 +62,22 @@ if __name__ == "__main__":
     agent_alias_id = os.environ.get("AGENT_ALIAS_ID", "")
     session_id = str(uuid.uuid4())
     with tracer.start_as_current_span(
-        name=f"invoke_agent {agent_id}",
+        name=f"bedrock_agent_invocation",
         kind=SpanKind.CLIENT,
         attributes={
-            # Add LangSmith-specific attributes
-            "langsmith.span.kind": "LLM",
+            # LangSmith standard attributes
+            "langsmith.span.kind": "CHAIN",
+            "langsmith.run_name": f"Bedrock Agent {agent_id}",
+            "langsmith.run_type": "chain",
             "langsmith.metadata.user_id": session_id,
+            
+            # GenAI attributes
             SpanAttributes.OPERATION_NAME: "invoke_agent",
             SpanAttributes.SYSTEM: "aws.bedrock",
             SpanAttributes.AGENT_ID: agent_id,
+            "gen_ai.agent_alias.id": agent_alias_id,
+            "gen_ai.prompt": agent_prompt,
+            "gen_ai.session_id": session_id
         },
     ) as rootSpan:
         response = client.invoke_agent(
@@ -85,6 +92,18 @@ if __name__ == "__main__":
             },
         )
         output = observe_response(response)
+        # Add the final output to the root span
+        rootSpan.set_attribute("gen_ai.completion", output)
+        rootSpan.set_attribute("langchain.output", output)
         print(output)
+
+    # Make sure all spans are properly ended before shutdown
+    for span_id, span in list(active_spans.items()):
+        try:
+            if span:
+                span.end()
+        except Exception as e:
+            print(f"Error ending span {span_id}: {e}")
+    active_spans.clear()
 
     provider.shutdown()

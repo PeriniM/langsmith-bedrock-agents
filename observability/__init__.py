@@ -1,14 +1,21 @@
 from opentelemetry import trace as otel
 from .attributes import SpanAttributes
+import json
+from datetime import datetime
 
 tracer = otel.get_tracer("bedrock-agents")
 
-agent_aliases_to_name = {}
+# Store active spans by trace_id rather than agent_id
+active_spans = {}
 
 
 def observe_response(response):
     output = ""
-    span = otel.get_current_span()
+    root_span = otel.get_current_span()
+    
+    # Clear any stale spans
+    active_spans.clear()
+    
     if "completion" in response:
         _event_stream = response["completion"]
         for event in _event_stream:
@@ -17,11 +24,16 @@ def observe_response(response):
             if "trace" in event:
                 process_trace(event["trace"])
 
-    span.set_attribute(SpanAttributes.COMPLETION, output)
-    span.set_attribute(SpanAttributes.COMPLETION_ROLE, "agent")
+    # Set attributes on the root span
+    root_span.set_attribute(SpanAttributes.COMPLETION, output)
+    root_span.set_attribute(SpanAttributes.COMPLETION_ROLE, "assistant")
+    root_span.set_attribute(SpanAttributes.LC_COMPLETION, output)
+    
     # Add LangSmith-specific attributes
-    span.set_attribute("gen_ai.completion.0.content", output)
-    span.set_attribute("gen_ai.completion.0.role", "agent")
+    root_span.set_attribute("gen_ai.completion.0.content", output)
+    root_span.set_attribute("gen_ai.completion.0.role", "assistant")
+    root_span.set_attribute(SpanAttributes.SPAN_KIND, "LLM")
+    
     return output
 
 
@@ -29,44 +41,71 @@ def process_trace(trace):
     print(trace)
     agent_id = trace["agentId"]
     agent_alias_id = trace["agentAliasId"]
+    session_id = trace.get("sessionId", "")
+    
+    # Create a unique run ID for this trace to group related spans
+    trace_run_id = f"{agent_id}_{session_id}"
+    
+    # Add context to the trace data
     if "routingClassifierTrace" in trace["trace"]:
-        routing_trace(agent_id, trace)
+        routing_trace(trace_run_id, agent_id, trace)
     if "orchestrationTrace" in trace["trace"]:
-        orchestration_trace(agent_id, trace)
-    pass
+        orchestration_trace(trace_run_id, agent_id, trace)
 
 
-def routing_trace(agent_id, trace):
-    routing_span = get_span(agent_id, "agent_routing")
+def routing_trace(trace_run_id, agent_id, trace):
     routing_data = (
         trace["trace"]["routingClassifierTrace"]
         if "trace" in trace and "routingClassifierTrace" in trace["trace"]
         else {}
     )
+    
+    # Create a unique identifier for this span
+    span_id = f"{trace_run_id}_routing_{trace.get('trace', {}).get('routingClassifierTrace', {}).get('traceId', '')}"
+    
+    # Create a new span if one doesn't exist for this trace part
+    if span_id not in active_spans:
+        span = tracer.start_span(
+            name="agent_routing",
+            attributes={
+                SpanAttributes.SPAN_KIND: "CHAIN",
+                SpanAttributes.OPERATION_NAME: "route_agent",
+                SpanAttributes.SYSTEM: "aws.bedrock",
+                SpanAttributes.AGENT_ID: agent_id,
+                "gen_ai.trace_id": span_id,
+                "gen_ai.component": "routing"
+            },
+        )
+        active_spans[span_id] = span
+    
+    span = active_spans[span_id]
+    
     if "modelInvocationInput" in routing_data:
         model_invoke_data = routing_data["modelInvocationInput"]
-        handle_model_invoke_input(routing_span, model_invoke_data)
+        handle_model_invoke_input(span, model_invoke_data)
+        
     if "modelInvocationOutput" in routing_data:
         model_output = routing_data["modelInvocationOutput"]
-        handle_model_invoke_output(routing_span, model_output)
+        handle_model_invoke_output(span, model_output)
+        
     if "observation" in routing_data:
         if "finalResponse" in routing_data["observation"]:
             response_text = routing_data["observation"].get("finalResponse", {}).get("text", "")
-            routing_span.set_attribute(
-                SpanAttributes.COMPLETION,
-                response_text,
-            )
-            # Add LangSmith-specific attribute
-            routing_span.set_attribute("gen_ai.completion.0.content", response_text)
-            routing_span.set_attribute("gen_ai.completion.0.role", "agent")
-            routing_span.end()
+            span.set_attribute(SpanAttributes.COMPLETION, response_text)
+            span.set_attribute("gen_ai.completion.0.content", response_text)
+            span.set_attribute("gen_ai.completion.0.role", "agent")
+            
+            # Only end the span when we have a final response
+            if span_id in active_spans:
+                span.end()
+                del active_spans[span_id]
+                
         if "agentCollaboratorInvocationOutput" in routing_data["observation"]:
-            agent_collab_data = routing_data["observation"][
-                "agentCollaboratorInvocationOutput"
-            ]
+            agent_collab_data = routing_data["observation"]["agentCollaboratorInvocationOutput"]
             name = agent_collab_data.get("agentCollaboratorName", "")
-            ca = extract_agent_id_from_arn(agent_collab_data)
-            print(ca)
+            collab_agent_id = extract_agent_id_from_arn(agent_collab_data)
+            span.set_attribute("gen_ai.collaborator.agent_id", collab_agent_id)
+            span.set_attribute("gen_ai.collaborator.name", name)
 
 
 def extract_agent_id_from_arn(agent_collab_data):
@@ -77,58 +116,119 @@ def extract_agent_id_from_arn(agent_collab_data):
         arn = arn[pos:]
         pos = arn.find("/")
         if pos > 0:
-            agent_id = arn[pos:]
+            agent_id = arn[pos + 1:]
             return agent_id
     return None
 
 
-def orchestration_trace(agent_id, trace):
-    orchestration_span = get_span(agent_id, f"invoke_agent {agent_id}")
+def orchestration_trace(trace_run_id, agent_id, trace):
     orchestration_data = (
         trace["trace"]["orchestrationTrace"]
         if "trace" in trace and "orchestrationTrace" in trace["trace"]
         else {}
     )
+    
+    # Create a unique identifier for this orchestration span
+    trace_id = orchestration_data.get("traceId", "")
+    span_id = f"{trace_run_id}_orchestration_{trace_id}"
+    
+    # Create a new span if one doesn't exist for this trace part
+    if span_id not in active_spans:
+        span = tracer.start_span(
+            name=f"agent_orchestration",
+            attributes={
+                SpanAttributes.SPAN_KIND: "CHAIN",
+                SpanAttributes.OPERATION_NAME: "orchestrate_agent",
+                SpanAttributes.SYSTEM: "aws.bedrock",
+                SpanAttributes.AGENT_ID: agent_id,
+                "gen_ai.trace_id": trace_id,
+                "gen_ai.component": "orchestration"
+            },
+        )
+        active_spans[span_id] = span
+    
+    span = active_spans[span_id]
+    
     if "modelInvocationInput" in orchestration_data:
         model_invoke_data = orchestration_data["modelInvocationInput"]
-        handle_model_invoke_input(orchestration_span, model_invoke_data)
+        handle_model_invoke_input(span, model_invoke_data)
+        
     if "modelInvocationOutput" in orchestration_data:
         model_output = orchestration_data["modelInvocationOutput"]
-        handle_model_invoke_output(orchestration_span, model_output)
-    if "rationale" in orchestration_data:
-        rationale_text = orchestration_data["rationale"].get("text", "")
-        orchestration_span.set_attribute(
-            SpanAttributes.COMPLETION + ".0",
-            rationale_text,
-        )
-        # Add LangSmith-specific attribute for rationale
-        orchestration_span.set_attribute("gen_ai.reasoning", rationale_text)
+        handle_model_invoke_output(span, model_output)
+        
+    if "invocationInput" in orchestration_data:
+        # This is a tool invocation - create a nested span for it
+        tool_name = orchestration_data.get("invocationInput", {}).get("actionGroupInvocationInput", {}).get("function", "")
+        action_group = orchestration_data.get("invocationInput", {}).get("actionGroupInvocationInput", {}).get("actionGroupName", "")
+        
+        tool_span_id = f"{span_id}_tool_{tool_name}"
+        if tool_span_id not in active_spans:
+            tool_span = tracer.start_span(
+                name=f"tool_execution_{tool_name}",
+                attributes={
+                    SpanAttributes.SPAN_KIND: "TOOL",
+                    "gen_ai.tool.name": tool_name,
+                    "gen_ai.action_group": action_group
+                },
+            )
+            active_spans[tool_span_id] = tool_span
+    
     if "observation" in orchestration_data:
-        response_text = orchestration_data["observation"].get("finalResponse", {}).get("text", "")
-        orchestration_span.set_attribute(
-            SpanAttributes.COMPLETION,
-            response_text,
-        )
-        # Add LangSmith-specific attribute for final response
-        orchestration_span.set_attribute("gen_ai.completion.0.content", response_text)
-        orchestration_span.set_attribute("gen_ai.completion.0.role", "assistant")
-        orchestration_span.end()
+        if "actionGroupInvocationOutput" in orchestration_data["observation"]:
+            # This is a tool result
+            tool_result = orchestration_data["observation"]["actionGroupInvocationOutput"]
+            tool_text = tool_result.get("text", "")
+            
+            # Find the corresponding tool span
+            for key, tool_span in list(active_spans.items()):
+                if key.startswith(f"{span_id}_tool_"):
+                    tool_span.set_attribute("gen_ai.tool.output", tool_text)
+                    tool_span.end()
+                    del active_spans[key]
+                    break
+        
+        if "finalResponse" in orchestration_data["observation"]:
+            response_text = orchestration_data["observation"].get("finalResponse", {}).get("text", "")
+            span.set_attribute(SpanAttributes.COMPLETION, response_text)
+            span.set_attribute("gen_ai.completion.0.content", response_text)
+            span.set_attribute("gen_ai.completion.0.role", "assistant")
+            
+            # Only end the span when we have a final response
+            if span_id in active_spans:
+                span.end()
+                del active_spans[span_id]
 
 
 def handle_model_invoke_input(span, model_invoke_data):
-    model_name = model_invoke_data.get("foundationModel")
-    prompt_text = model_invoke_data.get("text")
+    model_name = model_invoke_data.get("foundationModel", "")
+    prompt_text = model_invoke_data.get("text", "")
     
-    span.set_attribute(
-        SpanAttributes.RESPONSE_MODEL, model_name
-    )
+    # Create a unique identifier for this LLM span
+    trace_id = model_invoke_data.get("traceId", "")
+    
+    # Set both GenAI and LangChain compatible attributes
+    span.set_attribute(SpanAttributes.RESPONSE_MODEL, model_name)
     span.set_attribute(SpanAttributes.PROMPT, prompt_text)
+    span.set_attribute(SpanAttributes.LC_PROMPT, prompt_text)
     
-    # Add LangSmith-specific attributes
-    span.set_attribute("langsmith.span.kind", "LLM")
+    # Add LangSmith-specific attributes with better structured data
+    span.set_attribute(SpanAttributes.SPAN_KIND, "LLM")
     span.set_attribute("gen_ai.request.model", model_name)
-    span.set_attribute("gen_ai.prompt.0.content", prompt_text)
-    span.set_attribute("gen_ai.prompt.0.role", "user")
+    
+    # Try to parse the JSON prompt for better visualization
+    try:
+        prompt_json = json.loads(prompt_text)
+        if "messages" in prompt_json:
+            for i, msg in enumerate(prompt_json.get("messages", [])):
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                span.set_attribute(f"gen_ai.prompt.{i}.role", role)
+                span.set_attribute(f"gen_ai.prompt.{i}.content", content)
+    except:
+        # Fall back to simple prompt capture if JSON parsing fails
+        span.set_attribute("gen_ai.prompt.0.content", prompt_text)
+        span.set_attribute("gen_ai.prompt.0.role", "user")
     
     inference_config = {}
     if "inferenceConfiguration" in model_invoke_data:
@@ -147,42 +247,32 @@ def handle_model_invoke_output(span, model_data):
     metadata = model_data.get("metadata", {})
     input_tokens = metadata.get("usage", {}).get("inputTokens", 0)
     output_tokens = metadata.get("usage", {}).get("outputTokens", 0)
+    total_tokens = input_tokens + output_tokens
     
-    span.set_attribute(
-        SpanAttributes.USAGE_PROMPT_TOKENS,
-        input_tokens,
-    )
-    span.set_attribute(
-        SpanAttributes.USAGE_COMPLETION_TOKENS,
-        output_tokens,
-    )
+    # Include both individual and total token counts
+    span.set_attribute(SpanAttributes.USAGE_PROMPT_TOKENS, input_tokens)
+    span.set_attribute(SpanAttributes.USAGE_COMPLETION_TOKENS, output_tokens)
+    span.set_attribute(SpanAttributes.USAGE_TOTAL_TOKENS, total_tokens)
     
-    # Add LangSmith-specific attributes for token usage
-    span.set_attribute("gen_ai.usage.prompt_tokens", input_tokens)
-    span.set_attribute("gen_ai.usage.completion_tokens", output_tokens)
-    span.set_attribute("gen_ai.usage.total_tokens", input_tokens + output_tokens)
-    
-    pass
-    ## TODO: process content to extract chain of thoughts
-
-
-span_handler = {}
-
-
-def get_span(agent_id, name):
-    if agent_id in span_handler:
-        return span_handler.get(agent_id)
-    span = tracer.start_span(
-        name=name,
-        kind=otel.SpanKind.SERVER,
-        attributes={
-            SpanAttributes.OPERATION_NAME: "invoke_agent",
-            SpanAttributes.SYSTEM: "aws.bedrock",
-            SpanAttributes.AGENT_ID: agent_id,
-            # Add LangSmith-specific attributes
-            "langsmith.span.kind": "LLM",
-            "gen_ai.system": "aws.bedrock",
-        },
-    )
-    span_handler[agent_id] = span
-    return span
+    # Handle raw response if available
+    if "rawResponse" in model_data and "content" in model_data["rawResponse"]:
+        content = model_data["rawResponse"]["content"]
+        
+        # Try to parse the response JSON for better visualization
+        try:
+            response_json = json.loads(content)
+            if "output" in response_json and "message" in response_json["output"]:
+                message_content = response_json["output"]["message"].get("content", [])
+                for i, item in enumerate(message_content):
+                    if "text" in item and item["text"]:
+                        span.set_attribute(f"gen_ai.completion.{i}.content", item["text"])
+                        span.set_attribute(f"gen_ai.completion.{i}.role", "assistant")
+        except:
+            # Fall back to adding the raw response
+            span.set_attribute("gen_ai.raw_response", content)
+        
+    # Add stop reason if available
+    stop_reason = None
+    if "rawResponse" in model_data and "stopReason" in model_data["rawResponse"]:
+        stop_reason = model_data["rawResponse"].get("stopReason")
+        span.set_attribute("gen_ai.stop_reason", stop_reason)
